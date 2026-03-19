@@ -3,13 +3,17 @@ print("[unlockall] Game loaded")
 assert(hookmetamethod, "[ascida]: Your executor doesn't support this.")
 print("[unlockall] hookmetamethod available")
 
-for i, v in getgc() do
-    if typeof(v) == "function" and string.find(debug.info(v, "s"), "AnalyticsPipelineController") then
-        local orig = hookfunction(v, newcclosure(function(...)
-            if checkcaller() then return orig(...) end
-            return nil
-        end))
-        print("[unlockall] AnalyticsPipelineController hooked")
+-- FIX: debug.info returns nil for C functions; string.find(nil,...) would crash
+for _, v in getgc() do
+    if typeof(v) == "function" then
+        local src = debug.info(v, "s")
+        if src and string.find(src, "AnalyticsPipelineController") then
+            local orig = hookfunction(v, newcclosure(function(...)
+                if checkcaller() then return orig(...) end
+                return nil
+            end))
+            print("[unlockall] AnalyticsPipelineController hooked")
+        end
     end
 end
 
@@ -17,6 +21,10 @@ local players           = game:GetService("Players")
 local replicatedStorage = game:GetService("ReplicatedStorage")
 local httpService       = game:GetService("HttpService")
 local localPlayer       = players.LocalPlayer
+
+-- OPT: cache lowercased name once — used in _PlayFinisher on every kill
+local localPlayerNameLower = localPlayer.Name:lower()
+
 print("[unlockall] Services acquired")
 
 local function waitForCharacter()
@@ -24,7 +32,7 @@ local function waitForCharacter()
         print("[unlockall] Waiting for character...")
         localPlayer.CharacterAdded:Wait()
     end
-    task.wait(0.3)
+    task.wait(1)
 end
 waitForCharacter()
 print("[unlockall] Character ready")
@@ -37,7 +45,9 @@ local function awaitChild(parent, name, limit)
         child    = parent:FindFirstChild(name)
         attempts = attempts + 1
         if attempts > (limit or 20) then
-            print("[unlockall] ERROR: '" .. name .. "' not found under " .. parent.Name)
+            -- FIX: parent.Name guarded — parent could theoretically be destroyed
+            local pname = pcall(function() return parent.Name end) and parent.Name or "?"
+            print("[unlockall] ERROR: '" .. name .. "' not found under " .. pname)
             return nil
         end
     until child
@@ -117,15 +127,6 @@ local loadSuccess, loadErr = pcall(function()
     end
 end)
 
--- Confirm cosmetics table populated (diagnostic: 1057 plain-string keys)
-do
-    local count = 0
-    if CosmeticLibrary and CosmeticLibrary.Cosmetics then
-        for _ in pairs(CosmeticLibrary.Cosmetics) do count = count + 1 end
-    end
-    print("[unlockall] CosmeticLibrary.Cosmetics entries:", count)
-end
-
 print("[unlockall] Module load:", tostring(loadSuccess), loadErr and tostring(loadErr) or "")
 
 if not loadSuccess or not CosmeticLibrary or not ItemLibrary or not DataController then
@@ -133,27 +134,79 @@ if not loadSuccess or not CosmeticLibrary or not ItemLibrary or not DataControll
     return
 end
 
--- ── Helpers ───────────────────────────────────────────────────────────────────
-local function GetAllWeaponMapsTo(bool)
-    local weapons = {}
+-- ── OPT: pre-built caches set up after modules are confirmed loaded ───────────
+
+-- Cache for DataController.GetUnlockedWeapons — built once, never changes at runtime
+-- OPT: was rebuilt on every call by iterating all ItemLibrary.Items each time
+local unlockedWeaponsCache = nil
+local function getUnlockedWeapons()
+    if unlockedWeaponsCache then return unlockedWeaponsCache end
+    unlockedWeaponsCache = {}
     if ItemLibrary and ItemLibrary.Items then
         for name in pairs(ItemLibrary.Items) do
-            if not name:find("MISSING_") then weapons[name] = bool end
+            if not name:find("MISSING_") then
+                unlockedWeaponsCache[name] = true
+            end
         end
     end
-    return weapons
+    return unlockedWeaponsCache
 end
 
-print("[unlockall] Patching DataController ownership...")
-DataController.OwnsAllWeapons     = function() return true end
-DataController.GetUnlockedWeapons = function() return GetAllWeaponMapsTo(true) end
-print("[unlockall] DataController ownership patched")
+-- OPT: single reusable proxy for CosmeticInventory ownership — was a new table
+-- allocation on every DataController:Get("CosmeticInventory") call
+local cosmeticInventoryProxy = setmetatable({}, {
+    __index    = function() return true end,
+    __newindex = function() end,  -- silently ignore any writes
+})
+
+-- OPT: ReplicatedClass enum keys cached after first lookup — was requiring the
+-- module and calling ToEnum("Data/Skin/Wrap/Charm") on every ClientViewModel.new
+local rcEnumsCache = nil
+local function getRCEnums()
+    if rcEnumsCache then return rcEnumsCache end
+    local ok, rc = pcall(require, replicatedStorage.Modules.ReplicatedClass)
+    if ok and rc then
+        rcEnumsCache = {
+            Data  = rc:ToEnum("Data"),
+            Skin  = rc:ToEnum("Skin"),
+            Wrap  = rc:ToEnum("Wrap"),
+            Charm = rc:ToEnum("Charm"),
+        }
+    end
+    return rcEnumsCache
+end
+
+-- OPT: Finishers folder cached once — was FindFirstChild on every kill
+local finishersFolder = replicatedStorage.Modules:FindFirstChild("Finishers")
 
 -- ── State ─────────────────────────────────────────────────────────────────────
 local equipped  = {}   -- equipped[weaponName][cosmeticType] = clonedData
 local favorites = {}   -- favorites[weaponName][cosmeticName] = bool
 local constructingWeapon, viewingProfile, lastUsedWeapon
 local hooksReady = false
+
+-- OPT: debounce replicate+save so rapid equips don't pile up waiting threads
+-- (previously every single equip spawned its own thread that could wait 10s)
+local replicatePending = false
+local function scheduleReplicate()
+    if replicatePending then return end
+    replicatePending = true
+    task.spawn(function()
+        local waited = 0
+        while not hooksReady and waited < 10 do
+            task.wait(0.1)
+            waited = waited + 0.1
+        end
+        replicatePending = false
+        print("[unlockall] Replicating WeaponInventory...")
+        local ok, err = pcall(function()
+            DataController.CurrentData:Replicate("WeaponInventory")
+        end)
+        print("[unlockall] Replicate:", tostring(ok), err and tostring(err) or "")
+        -- saveConfig deferred so file I/O doesn't block the replicate
+        task.defer(saveConfig)
+    end)
+end
 
 local SKIP_COSMETIC_NAMES = {
     RANDOM_COSMETIC = true,
@@ -162,12 +215,8 @@ local SKIP_COSMETIC_NAMES = {
 }
 
 -- ── cloneCosmetic ─────────────────────────────────────────────────────────────
--- Diagnostic confirmed all 1057 Cosmetics keys are plain strings.
--- All previously-failing skins are DIRECT HITs (AKEY-47, AUG, Tommy Gun, etc.).
--- RENAMED_COSMETICS has 12 entries and is applied first as a safety net.
 local function cloneCosmetic(name, cosmeticType, options)
     if not name or SKIP_COSMETIC_NAMES[name] then
-        print("[unlockall] cloneCosmetic: skipping special name:", tostring(name))
         return nil
     end
     if not CosmeticLibrary or not CosmeticLibrary.Cosmetics then
@@ -175,15 +224,15 @@ local function cloneCosmetic(name, cosmeticType, options)
         return nil
     end
 
-    -- 1. Apply the game's own rename map first
+    -- 1. Apply game's own rename map (12 entries: "Bone Crossbow" -> "Crossbone" etc.)
     local resolvedName = (CosmeticLibrary.RENAMED_COSMETICS
         and CosmeticLibrary.RENAMED_COSMETICS[name])
         or name
 
-    -- 2. Direct string lookup (covers all normal cases per diagnostic)
+    -- 2. Direct string lookup (covers all 1057 normal cases per diagnostic)
     local base = CosmeticLibrary.Cosmetics[resolvedName]
 
-    -- 3. Case-insensitive fallback
+    -- 3. Case-insensitive fallback (safety net only)
     if not base then
         local lower = resolvedName:lower()
         for k, v in pairs(CosmeticLibrary.Cosmetics) do
@@ -217,7 +266,7 @@ local function cloneCosmetic(name, cosmeticType, options)
 
     local data = {}
     for k, v in pairs(base) do data[k] = v end
-    data.Name = resolvedName   -- canonical name
+    data.Name = resolvedName
     data.Type = data.Type or cosmeticType
     data.Seed = math.random(1, 1000000)
 
@@ -242,7 +291,7 @@ end
 -- ── Config persistence ────────────────────────────────────────────────────────
 local saveFile = "unlockall/config.json"
 
-local function saveConfig()
+function saveConfig()
     if not writefile then return end
     task.spawn(function()
         pcall(function()
@@ -282,8 +331,8 @@ local function loadConfig()
                         cosmeticData.name, cosmeticType, { inverted = cosmeticData.inverted }
                     )
                     if cloned then
-                        cloned.Seed                      = cosmeticData.seed
-                        equipped[weapon][cosmeticType]   = cloned
+                        cloned.Seed                    = cosmeticData.seed
+                        equipped[weapon][cosmeticType] = cloned
                         print("[unlockall] Loaded:", weapon, cosmeticType, cosmeticData.name)
                     else
                         print("[unlockall] FAILED to clone:", weapon, cosmeticType, cosmeticData.name)
@@ -295,6 +344,12 @@ local function loadConfig()
         print("[unlockall] Config load complete")
     end)
 end
+
+-- ── Patch DataController ownership ───────────────────────────────────────────
+print("[unlockall] Patching DataController...")
+DataController.OwnsAllWeapons     = function() return true end
+DataController.GetUnlockedWeapons = getUnlockedWeapons  -- OPT: uses cached table
+print("[unlockall] DataController ownership patched")
 
 -- ── Patch CosmeticLibrary ─────────────────────────────────────────────────────
 print("[unlockall] Patching CosmeticLibrary...")
@@ -314,10 +369,11 @@ print("[unlockall] CosmeticLibrary patched")
 -- ── Patch DataController.Get ──────────────────────────────────────────────────
 local originalGet = DataController.Get
 DataController.Get = function(self, key)
-    local data = originalGet(self, key)
+    -- OPT: return the single cached proxy instead of allocating a new table each call
     if key == "CosmeticInventory" then
-        return setmetatable({}, { __index = function() return true end })
+        return cosmeticInventoryProxy
     end
+    local data = originalGet(self, key)
     if key == "FavoritedCosmetics" then
         local result = {}
         if data then for k, v in pairs(data) do result[k] = v end end
@@ -384,32 +440,16 @@ task.spawn(function()
     local oldNamecall
     oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
         if getnamecallmethod() ~= "FireServer" then return oldNamecall(self, ...) end
-        local args = { ... }
 
-        -- Track last used weapon for finisher injection
-        if useItemRemote and self == useItemRemote and FighterController then
-            task.spawn(function()
-                pcall(function()
-                    local fighter = FighterController:GetFighter(localPlayer)
-                    if fighter and fighter.Items then
-                        for _, item in pairs(fighter.Items) do
-                            if item:Get("ObjectID") == args[1] then
-                                lastUsedWeapon = item.Name
-                                print("[unlockall] lastUsedWeapon:", lastUsedWeapon)
-                                break
-                            end
-                        end
-                    end
-                end)
-            end)
-        end
+        -- OPT: previously `local args = { ... }` ran here for EVERY FireServer call
+        -- in the entire game. Now we only unpack ... when self actually matches one
+        -- of our remotes, eliminating table allocation on all unrelated calls.
 
         if self == equipRemote then
-            local weaponName, cosmeticType, cosmeticName = args[1], args[2], args[3]
-            local options = args[4] or {}
+            local weaponName, cosmeticType, cosmeticName, options = ...
+            options = options or {}
             print("[unlockall] equipRemote:", weaponName, cosmeticType, cosmeticName)
 
-            -- Pass special internal names straight to the server unchanged
             if SKIP_COSMETIC_NAMES[cosmeticName] then
                 print("[unlockall] Passing through special name:", cosmeticName)
                 return oldNamecall(self, ...)
@@ -435,28 +475,36 @@ task.spawn(function()
                 end
             end
 
-            task.spawn(function()
-                local waited = 0
-                while not hooksReady and waited < 10 do
-                    task.wait(0.1)
-                    waited = waited + 0.1
-                end
-                print("[unlockall] Calling Replicate WeaponInventory...")
-                local ok, err = pcall(function()
-                    DataController.CurrentData:Replicate("WeaponInventory")
-                end)
-                print("[unlockall] Replicate:", tostring(ok), err and tostring(err) or "")
-                saveConfig()
-            end)
-            return  -- suppress the original FireServer call
+            -- OPT: single debounced replicate instead of a new waiting thread per equip
+            scheduleReplicate()
+            return
         end
 
         if favoriteRemote and self == favoriteRemote then
-            print("[unlockall] favoriteRemote:", args[1], args[2], tostring(args[3]))
-            favorites[args[1]]         = favorites[args[1]] or {}
-            favorites[args[1]][args[2]] = args[3] or nil
+            local a1, a2, a3 = ...
+            print("[unlockall] favoriteRemote:", a1, a2, tostring(a3))
+            favorites[a1]     = favorites[a1] or {}
+            favorites[a1][a2] = a3 or nil
             saveConfig()
-            return  -- suppress the original FireServer call
+            return
+        end
+
+        if useItemRemote and self == useItemRemote and FighterController then
+            local itemObjectID = ...   -- only need the first arg; no table needed
+            task.spawn(function()
+                pcall(function()
+                    local fighter = FighterController:GetFighter(localPlayer)
+                    if fighter and fighter.Items then
+                        for _, item in pairs(fighter.Items) do
+                            if item:Get("ObjectID") == itemObjectID then
+                                lastUsedWeapon = item.Name
+                                print("[unlockall] lastUsedWeapon:", lastUsedWeapon)
+                                break
+                            end
+                        end
+                    end
+                end)
+            end)
         end
 
         return oldNamecall(self, ...)
@@ -553,7 +601,8 @@ task.spawn(function()
                     and self.ClientItem.ClientFighter.Player
                 if weaponName and weaponPlayer == localPlayer
                         and equipped[weaponName] and equipped[weaponName].Wrap then
-                    print("[unlockall] GetWrap: returning wrap for", weaponName)
+                    -- OPT: removed print here — GetWrap fires every frame during
+                    -- weapon rendering; printing here caused significant spam
                     return equipped[weaponName].Wrap
                 end
                 return orig(self)
@@ -569,26 +618,29 @@ task.spawn(function()
             local weaponName   = constructingWeapon or clientItem.Name
             if weaponPlayer == localPlayer and equipped[weaponName] then
                 pcall(function()
-                    local ReplicatedClass = require(replicatedStorage.Modules.ReplicatedClass)
-                    local dataKey         = ReplicatedClass:ToEnum("Data")
-                    replicatedData[dataKey] = replicatedData[dataKey] or {}
+                    -- OPT: getRCEnums() caches all four ToEnum calls after first use.
+                    -- Previously required the module and called ToEnum 3x on every spawn.
+                    local enums = getRCEnums()
+                    if not enums then return end
+                    replicatedData[enums.Data] = replicatedData[enums.Data] or {}
                     local cosmetics = equipped[weaponName]
                     if cosmetics.Skin then
-                        replicatedData[dataKey][ReplicatedClass:ToEnum("Skin")]  = cosmetics.Skin
+                        replicatedData[enums.Data][enums.Skin] = cosmetics.Skin
                         print("[unlockall] ClientViewModel.new: Skin for", weaponName)
                     end
                     if cosmetics.Wrap then
-                        replicatedData[dataKey][ReplicatedClass:ToEnum("Wrap")]  = cosmetics.Wrap
+                        replicatedData[enums.Data][enums.Wrap] = cosmetics.Wrap
                         print("[unlockall] ClientViewModel.new: Wrap for", weaponName)
                     end
                     if cosmetics.Charm then
-                        replicatedData[dataKey][ReplicatedClass:ToEnum("Charm")] = cosmetics.Charm
+                        replicatedData[enums.Data][enums.Charm] = cosmetics.Charm
                         print("[unlockall] ClientViewModel.new: Charm for", weaponName)
                     end
                 end)
             end
             local result = origNew(replicatedData, clientItem)
-            if weaponPlayer == localPlayer and equipped[weaponName]
+            -- FIX: origNew could theoretically return nil; guard before indexing
+            if result and weaponPlayer == localPlayer and equipped[weaponName]
                     and equipped[weaponName].Wrap and result._UpdateWrap then
                 task.spawn(function()
                     result:_UpdateWrap()
@@ -618,47 +670,74 @@ task.spawn(function()
         print("[unlockall] ViewProfile.Fetch hooked")
     end)
 
-    -- ClientEntity.ReplicateFromServer (finisher injection)
+    -- ── Finisher injection via ClientEntity._PlayFinisher ─────────────────────
+    --
+    -- _PlayFinisher(self, finisherName, isFinal, eliminator, serial)
+    --   finisherName  = plain string already decoded from enum, e.g. "OOF"
+    --   isFinal       = bool — whether this is the killing blow finisher
+    --   eliminator    = killing player (Player object, string name, or enum userdata)
+    --   serial        = replication serial number
     pcall(function()
-        print("[unlockall] Hooking ClientEntity.ReplicateFromServer...")
+        print("[unlockall] Hooking ClientEntity._PlayFinisher...")
         local ClientEntity = require(
             playerScripts.Modules.ClientReplicatedClasses.ClientEntity
         )
-        if not ClientEntity.ReplicateFromServer then
-            print("[unlockall] ClientEntity.ReplicateFromServer not found")
+        if not ClientEntity._PlayFinisher then
+            print("[unlockall] ClientEntity._PlayFinisher not found")
             return
         end
-        local orig = ClientEntity.ReplicateFromServer
-        ClientEntity.ReplicateFromServer = function(self, action, ...)
-            if action == "FinisherEffect" then
-                local args          = { ... }
-                local killerName    = args[3]
-                local decodedKiller = killerName
-                if type(killerName) == "userdata" and EnumLibrary and EnumLibrary.FromEnum then
-                    pcall(function() decodedKiller = EnumLibrary:FromEnum(killerName) end)
-                end
-                local isOurKill = tostring(decodedKiller) == localPlayer.Name
-                    or tostring(decodedKiller):lower() == localPlayer.Name:lower()
-                if isOurKill and lastUsedWeapon
-                        and equipped[lastUsedWeapon]
-                        and equipped[lastUsedWeapon].Finisher then
-                    local finisherData = equipped[lastUsedWeapon].Finisher
-                    local finisherEnum = finisherData.Enum
-                    if not finisherEnum and EnumLibrary then
-                        pcall(function()
-                            finisherEnum = EnumLibrary:ToEnum(finisherData.Name)
-                        end)
+
+        local orig = ClientEntity._PlayFinisher
+        ClientEntity._PlayFinisher = function(self, finisherName, isFinal, eliminator, serial)
+
+            -- Determine if this kill is ours
+            -- Eliminator can be: Player instance, string, or opaque enum userdata
+            local isOurKill = false
+            if eliminator == localPlayer then
+                isOurKill = true
+            elseif type(eliminator) == "string" then
+                isOurKill = eliminator == localPlayer.Name
+                    or eliminator:lower() == localPlayerNameLower  -- OPT: cached
+            elseif typeof(eliminator) == "userdata" and EnumLibrary then
+                pcall(function()
+                    local decoded = EnumLibrary:FromEnum(eliminator)
+                    if decoded then
+                        local ds = tostring(decoded)
+                        isOurKill = ds == localPlayer.Name
+                            or ds:lower() == localPlayerNameLower  -- OPT: cached
                     end
-                    if finisherEnum then
-                        print("[unlockall] FinisherEffect: injecting for", lastUsedWeapon)
-                        args[1] = finisherEnum
-                        return orig(self, action, table.unpack(args))
+                end)
+            end
+
+            if isOurKill then
+                -- Prefer lastUsedWeapon; fall back to any weapon with a Finisher equipped
+                local weaponToUse = lastUsedWeapon
+                if not (weaponToUse and equipped[weaponToUse] and equipped[weaponToUse].Finisher) then
+                    for wName, cosmetics in pairs(equipped) do
+                        if cosmetics.Finisher then
+                            weaponToUse = wName
+                            break
+                        end
+                    end
+                end
+
+                if weaponToUse and equipped[weaponToUse] and equipped[weaponToUse].Finisher then
+                    local override = equipped[weaponToUse].Finisher.Name
+                    -- OPT: finishersFolder cached at startup — no FindFirstChild on each kill
+                    if finishersFolder and finishersFolder:FindFirstChild(override) then
+                        print("[unlockall] _PlayFinisher: injecting", override,
+                              "(was:", finisherName .. ")", "weapon:", weaponToUse)
+                        finisherName = override
+                    else
+                        print("[unlockall] _PlayFinisher: no module for",
+                              override, "- keeping", finisherName)
                     end
                 end
             end
-            return orig(self, action, ...)
+
+            return orig(self, finisherName, isFinal, eliminator, serial)
         end
-        print("[unlockall] ClientEntity.ReplicateFromServer hooked")
+        print("[unlockall] ClientEntity._PlayFinisher hooked")
     end)
 
     hooksReady = true
